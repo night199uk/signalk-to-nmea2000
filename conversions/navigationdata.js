@@ -1,3 +1,8 @@
+const path = require('node:path');
+const _ = require('lodash')
+
+const routeWPDataItemsPerPacket = 3
+
 const sourceDataKeys = [
   'Rhumbline',
   'Great Circle',
@@ -246,6 +251,187 @@ module.exports = (app, plugin) => {
         }]
       }]
     }
+  },
+  {
+    title: 'Route/WP Information (129285)',
+    optionKey: 'routewpinformation',
+    conversions: (options) => {
+      return [{
+        interval: 10000,
+        sourceType: 'timer',
+        callback: async (app) => {
+          var course = await app.courseApi.getCourse()
+          if (!course.activeRoute?.href)
+            return null
+
+          route = await app.resourcesApi.getResource('routes', path.basename(course.activeRoute.href))
+          if (!route)
+            return null
+
+          // console.log("course: %o", course)
+          coordinates = _.chunk(route.feature.geometry.coordinates, routeWPDataItemsPerPacket)
+          return coordinates.map((coords, i) => {
+            list = coords.map((coord, j) => {
+              waypointId = (routeWPDataItemsPerPacket * i) + j
+              return {
+                "WP ID": waypointId,
+                "WP Name": "Waypoint " + (waypointId + 1).toString(),
+                "WP Latitude": coord[0],
+                "WP Longitude": coord[1]
+              }
+            })
+
+            return {
+              pgn: 129285,
+              "prio": 7,
+              "Start RPS#" : i,
+              "nItems" : coords.length,
+              "Database ID" :  0,
+              "Route ID" :  0,
+              "Supplementary Route/WP data available" :  "Off",
+              "Reserved": "00",
+              "Route Name": course.activeRoute.name,
+              "list": list,
+              "Navigation direction in route" : course.activeRoute.reverse ? "Reverse" : "Forward",
+            }
+          })
+        },
+        tests: [{
+          input: [
+            mockApp,
+          ],
+          expected: [{
+            "prio": 7,
+            "pgn": 129285,
+            "dst": 255,
+            "fields": {
+              "Start RPS#": 0,
+              "nItems": 3,
+              "Database ID": 0,
+              "Route ID": 0,
+              "Navigation direction in route": "Forward",
+              "Supplementary Route/WP data available": "Off",
+              "list": [
+                {
+                  "WP ID": 0,
+                  "WP Latitude": -80.047748,
+                  "WP Longitude": 26.747961,
+                  "WP Name": "Waypoint 1",
+                },
+                {
+                  "WP ID": 1,
+                  "WP Latitude": -80.049322,
+                  "WP Longitude": 26.768562,
+                  "WP Name": "Waypoint 2",
+                },
+                {
+                  "WP ID": 2,
+                  "WP Latitude": -80.037314,
+                  "WP Longitude": 26.772696,
+                  "WP Name": "Waypoint 3",
+                },
+              ]
+            }
+          },{
+            "prio": 7,
+            "pgn": 129285,
+            "dst": 255,
+            "fields": {
+              "Start RPS#": 1,
+              "nItems": 3,
+              "Database ID": 0,
+              "Route ID": 0,
+              "Navigation direction in route": "Forward",
+              "Supplementary Route/WP data available": "Off",
+              "list": [
+                {
+                  "WP ID": 3,
+                  "WP Latitude": -80.023545,
+                  "WP Longitude": 26.771407,
+                  "WP Name": "Waypoint 4",
+                },
+                {
+                  "WP ID": 4,
+                  "WP Latitude": -78.7087,
+                  "WP Longitude": 26.476476,
+                  "WP Name": "Waypoint 5",
+                },
+                {
+                  "WP ID": 5,
+                  "WP Latitude": -78.62181,
+                  "WP Longitude": 26.486673,
+                  "WP Name": "Waypoint 6",
+                },
+              ]
+            }
+          },{
+            "prio": 7,
+            "pgn": 129285,
+            "dst": 255,
+            "fields": {
+              "Start RPS#": 2,
+              "nItems": 3,
+              "Database ID": 0,
+              "Route ID": 0,
+              "Navigation direction in route": "Forward",
+              "Supplementary Route/WP data available": "Off",
+              "list": [
+                {
+                  "WP ID": 6,
+                  "WP Latitude": -78.62966,
+                  "WP Longitude": 26.49787,
+                  "WP Name": "Waypoint 7",
+                },
+                {
+                  "WP ID": 7,
+                  "WP Latitude": -78.634808,
+                  "WP Longitude": 26.511982,
+                  "WP Name": "Waypoint 8",
+                },
+                {
+                  "WP ID": 8,
+                  "WP Latitude": -78.636158,
+                  "WP Longitude": 26.514194,
+                  "WP Name": "Waypoint 9",
+                },
+              ]
+            }
+          },{
+            "prio": 7,
+            "pgn": 129285,
+            "dst": 255,
+            "fields": {
+              "Start RPS#": 3,
+              "nItems": 3,
+              "Database ID": 0,
+              "Route ID": 0,
+              "Navigation direction in route": "Forward",
+              "Supplementary Route/WP data available": "Off",
+              "list": [
+                {
+                  "WP ID": 9,
+                  "WP Latitude": -78.637737,
+                  "WP Longitude": 26.515296,
+                  "WP Name": "Waypoint 10",
+                },
+                {
+                  "WP ID": 10,
+                  "WP Latitude": -78.637866,
+                  "WP Longitude": 26.516417,
+                  "WP Name": "Waypoint 11",
+                },
+                {
+                  "WP ID": 11,
+                  "WP Latitude": -78.635903,
+                  "WP Longitude": 26.517348,
+                  "WP Name": "Waypoint 12",
+                },
+              ]
+            }
+          }]
+        }]
+      }]
+    }
   }]
 }
 
@@ -261,7 +447,8 @@ mockApp = {
           type: "Location"
         },
         activeRoute: {
-          href: '',
+          href: 'mock',
+          reverse: false,
           pointIndex: 0,
           pointTotal: 12
         }
