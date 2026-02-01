@@ -4,6 +4,7 @@ const _ = require('lodash')
 const routeWPDataItemsPerPacket = 3
 
 module.exports = (app, plugin) => {
+  var sid129284 = 0;
   return [{
     pgn: 129283,
     title: 'Cross Track Error (129283)',
@@ -39,7 +40,6 @@ module.exports = (app, plugin) => {
       'navigation.course.calcValues.distance',
       'navigation.course.calcValues.bearingTrue',
       'navigation.course.calcValues.bearingTrackTrue',
-      'navigation.course.nextPoint',
       'navigation.course.calcValues.velocityMadeGood',
       'navigation.course.calcValues.calcMethod',
       'notifications.navigation.arrivalCircleEntered',
@@ -49,7 +49,7 @@ module.exports = (app, plugin) => {
     timeouts: [
       10000, 10000, 10000, 10000, 10000, undefined, undefined, undefined, undefined
     ],
-    callback: (distToDest, bearingToDest, bearingOriginToDest, destPos, WCV, calcMethod, ace, pp, rte) => {
+    callback: async (distToDest, bearingToDest, bearingOriginToDest, WCV, calcMethod, ace, pp, rte) => {
       var dateObj = new Date();
       var secondsToGo = Math.trunc(distToDest / WCV);
       var etaDate = Math.trunc((dateObj.getTime() / 1000 + secondsToGo) / 86400);
@@ -57,23 +57,34 @@ module.exports = (app, plugin) => {
                      dateObj.getUTCMinutes() * 60 +
                      dateObj.getUTCSeconds() +
                      secondsToGo) % 86400;
-      let wpid = rte && typeof rte?.pointIndex === 'number' ? rte.pointIndex + 1 : 0;
+
+      var course = await app.courseApi.getCourse()
+      if (!course)
+          return null
+
+      let waypointId = 1;
+      if (course.activeRoute && course.activeRoute?.pointIndex === 'number')
+        waypointId = course.activeRoute.pointIndex + 1
+
+      sid129284 = sid129284 == 252 ? 0 : sid129284 + 1
+
       return [{
         pgn: 129284,
-        "SID" : 0x88,
+        "SID" : sid129284,
         "Distance to Waypoint" :  distToDest,
         "Course/Bearing reference" : 0,
         "Perpendicular Crossed" : pp != null,
         "Arrival Circle Entered" : ace != null,
+        "Calculation Type" : calcMethod == "GreatCircle" ? 0 : 1,
         "Calculation Type" : calcMethod == "GreatCircle" ? 0 : 1,
         "ETA Time" : (WCV > 0) ? etaTime : undefined,
         "ETA Date": (WCV > 0) ? etaDate : undefined,
         "Bearing, Origin to Destination Waypoint" : bearingOriginToDest,
         "Bearing, Position to Destination Waypoint" : bearingToDest,
         "Origin Waypoint Number" : undefined,
-        "Destination Waypoint Number" : parseInt(wpid),
-        "Destination Latitude" : destPos?.position?.latitude,
-        "Destination Longitude" : destPos?.position?.longitude,
+        "Destination Waypoint Number" : waypointId,
+        "Destination Latitude" : course?.nextPoint?.position.latitude,
+        "Destination Longitude" : course?.nextPoint?.position.longitude,
         "Waypoint Closing Velocity" : WCV,
       }]
     },
@@ -84,12 +95,12 @@ module.exports = (app, plugin) => {
           //these change every time
           delete testResult.fields["ETA Date"]
           delete testResult.fields["ETA Time"]
+          delete testResult.fields["SID"]
         },
         "prio": 2,
         "pgn": 129284,
         "dst": 255,
         "fields": {
-          "SID": 136,
           "Distance to Waypoint": 12,
           "Course/Bearing reference": "True",
           "Perpendicular Crossed": "Yes",
