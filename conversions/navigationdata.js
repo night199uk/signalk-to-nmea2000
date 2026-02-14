@@ -1,6 +1,18 @@
 const path = require('node:path');
 const _ = require('lodash')
 
+// Known gaps from review, to be dealt with for both 129284 and 129285 in a
+// further commit:
+//
+// - Neither conversion checks where a value came from, so a destination or a
+//   calculated value that arrived from NMEA 2000 can be sent back onto the
+//   bus. The keyed 129284 conversion withheld the PGN in that case, and the
+//   per-key source selections it exposed are gone now that it is a timer.
+// - 129284 sends at once on a course change, before the course provider has
+//   recomputed the calculated values, so the new destination can briefly go
+//   out with the previous destination's distance and bearings. The next timer
+//   tick corrects it.
+
 const routeWPDataItemsPerPacket = 3
 
 // A course notification counts while it is raised; the course provider clears
@@ -11,6 +23,9 @@ const isRaised = (notification) => notification != null && notification.state !=
 // the changes; the timer sends a course held back by it.
 const routeWPOnChangeMinInterval = 1000
 
+// Likewise for 129284, so that a burst of course changes cannot flood the bus.
+const navigationDataOnChangeMinInterval = 1000
+
 // The route or single destination of the active course as 129285 messages,
 // null without one
 async function routeWPInformation(app) {
@@ -18,8 +33,8 @@ async function routeWPInformation(app) {
   if (!course?.nextPoint?.position)
     return null
   if (!course.activeRoute?.href) {
-    // A single destination goes out as a two-point route, from where
-    // the course started to the destination.
+    // A single destination goes out as waypoint 1; the course's previous
+    // point, when there is one, precedes it as the origin.
     const origin = course.previousPoint?.position
     const dest = course.nextPoint.position
     return [{
@@ -80,6 +95,70 @@ async function routeWPInformation(app) {
       "Navigation direction in route" : reverse ? "Reverse" : "Forward",
     }
   })
+}
+
+// An incrementing SID so that a receiver can tell one 129284 from the next.
+let sid129284 = 0
+
+// Navigation data of the active course as a 129284 message, or null without an
+// active destination. The destination comes from the Course API and the
+// calculated values from the Signal K tree, so that the same data can be sent
+// by the timer and by a course change.
+async function navigationData(app) {
+  const course = await app.courseApi.getCourse()
+  // The Course API returns an object even when no course is active; without a
+  // destination there is no navigation data to send.
+  if (!course?.nextPoint?.position)
+    return null
+
+  // The calculated values and the course notifications are each read as one
+  // subtree, rather than a call per path. The server nulls a value that has
+  // gone stale (meta.timeout), so a null here means there is nothing to send.
+  const calcValues = app.getSelfPath('navigation.course.calcValues') || {}
+  const distance = calcValues.distance?.value
+  if (distance == null)
+    return null
+
+  const bearingToDest = calcValues.bearingTrue?.value
+  const bearingOriginToDest = calcValues.bearingTrackTrue?.value
+  const WCV = calcValues.velocityMadeGood?.value
+  const calcMethod = calcValues.calcMethod?.value
+  const courseNotifications = app.getSelfPath('notifications.navigation.course') || {}
+  const ace = courseNotifications.arrivalCircleEntered?.value
+  const pp = courseNotifications.perpendicularPassed?.value
+
+  const dateObj = new Date()
+  const secondsToGo = Math.trunc(distance / WCV)
+  const etaDate = Math.trunc((dateObj.getTime() / 1000 + secondsToGo) / 86400)
+  const etaTime = (dateObj.getUTCHours() * (60 * 60) +
+                   dateObj.getUTCMinutes() * 60 +
+                   dateObj.getUTCSeconds() +
+                   secondsToGo) % 86400
+
+  // A single destination is waypoint 1 of the two-point route sent in 129285
+  const waypointId = course.activeRoute && typeof course.activeRoute.pointIndex === 'number'
+    ? course.activeRoute.pointIndex + 1 : 1
+
+  sid129284 = sid129284 == 252 ? 0 : sid129284 + 1
+
+  return [{
+    pgn: 129284,
+    "SID": sid129284,
+    "Distance to Waypoint": distance,
+    "Course/Bearing reference": 0,
+    "Perpendicular Crossed": isRaised(pp) ? "Yes" : "No",
+    "Arrival Circle Entered": isRaised(ace) ? "Yes" : "No",
+    "Calculation Type": calcMethod == null ? undefined : (calcMethod == "GreatCircle" ? 0 : 1),
+    "ETA Time": (WCV > 0) ? etaTime : undefined,
+    "ETA Date": (WCV > 0) ? etaDate : undefined,
+    "Bearing, Origin to Destination Waypoint": bearingOriginToDest,
+    "Bearing, Position to Destination Waypoint": bearingToDest,
+    "Origin Waypoint Number": undefined,
+    "Destination Waypoint Number": waypointId,
+    "Destination Latitude": course.nextPoint.position.latitude,
+    "Destination Longitude": course.nextPoint.position.longitude,
+    "Waypoint Closing Velocity": WCV,
+  }]
 }
 
 module.exports = (app, plugin) => {
@@ -158,125 +237,146 @@ module.exports = (app, plugin) => {
     pgn: 129284,
     title: 'Navigation Data (129284)',
     optionKey: 'navigationdata',
-    keys: [
-      'navigation.course.calcValues.distance',
-      'navigation.course.calcValues.bearingTrue',
-      'navigation.course.calcValues.bearingTrackTrue',
-      'navigation.course.nextPoint',
-      'navigation.course.calcValues.velocityMadeGood',
-      'navigation.course.calcValues.calcMethod',
-      'notifications.navigation.course.arrivalCircleEntered',
-      'notifications.navigation.course.perpendicularPassed',
-      'navigation.course.activeRoute'
-    ],
-    // nextPoint is sent when the destination is set or changed, not
-    // repeatedly, so it must not time out like the calculated values.
-    timeouts: [
-      10000, 10000, 10000, undefined, 10000, undefined, undefined, undefined, undefined
-    ],
-    callback: (distToDest, bearingToDest, bearingOriginToDest, destPos, WCV, calcMethod, ace, pp, rte) => {
-      var dateObj = new Date();
-      var secondsToGo = Math.trunc(distToDest / WCV);
-      var etaDate = Math.trunc((dateObj.getTime() / 1000 + secondsToGo) / 86400);
-      var etaTime = (dateObj.getUTCHours() * (60 * 60) +
-                     dateObj.getUTCMinutes() * 60 +
-                     dateObj.getUTCSeconds() +
-                     secondsToGo) % 86400;
-      // A single destination is waypoint 1 of the two-point route sent in 129285
-      let wpid = rte && typeof rte?.pointIndex === 'number' ? rte.pointIndex + 1 : 1;
+    conversions: (options) => {
+      let lastCourse
+      let lastSentAt = 0
+      let lastChangeSentAt = 0
+
+      // The timer and a course change both send through here. A course change
+      // just before a timer tick must not put two 129284s on the bus in the
+      // same second, so the change waits for the last send and the timer waits
+      // for a change's last send. A send that produces nothing does not count.
+      async function sendNavigationData(app, onCourseChange) {
+        const now = Date.now()
+        const since = onCourseChange ? lastSentAt : lastChangeSentAt
+        if (now - since < navigationDataOnChangeMinInterval)
+          return null
+        const pgns = await navigationData(app)
+        if (pgns != null) {
+          lastSentAt = now
+          if (onCourseChange)
+            lastChangeSentAt = now
+        }
+        return pgns
+      }
+
       return [{
-        pgn: 129284,
-        "SID" : 0x88,
-        "Distance to Waypoint" :  distToDest,
-        "Course/Bearing reference" : 0,
-        "Perpendicular Crossed" : isRaised(pp) ? "Yes" : "No",
-        "Arrival Circle Entered" : isRaised(ace) ? "Yes" : "No",
-        "Calculation Type" : calcMethod == "GreatCircle" ? 0 : 1,
-        "ETA Time" : (WCV > 0) ? etaTime : undefined,
-        "ETA Date": (WCV > 0) ? etaDate : undefined,
-        "Bearing, Origin to Destination Waypoint" : bearingOriginToDest,
-        "Bearing, Position to Destination Waypoint" : bearingToDest,
-        "Origin Waypoint Number" : undefined,
-        "Destination Waypoint Number" : parseInt(wpid),
-        "Destination Latitude" : destPos?.position?.latitude,
-        "Destination Longitude" : destPos?.position?.longitude,
-        "Waypoint Closing Velocity" : WCV,
-      }]
-    },
-    tests: [{
-      input: [ 12, 1.23, 3.1, {position: { longitude: -75.487264, latitude: 32.0631296 }} , 4.0, "Rhumbline", null, {state: "alert", method: ["visual"], message: "Perpendicular passed"}, {pointIndex: 5} ],
-      expected: [{
-        "__preprocess__": (testResult) => {
-          //these change every time
-          delete testResult.fields["ETA Date"]
-          delete testResult.fields["ETA Time"]
+        // The values are read from the tree per tick, so that a value the
+        // server has nulled as stale is not sent forever.
+        interval: 1000,
+        sourceType: 'timer',
+        callback: (app) => sendNavigationData(app, false),
+        tests: [{
+          // an active route
+          input: [ mockNavApp ],
+          expected: [{
+            "__preprocess__": (testResult) => {
+              // the SID increments on every message
+              delete testResult.fields["SID"]
+              // these change every time
+              delete testResult.fields["ETA Date"]
+              delete testResult.fields["ETA Time"]
+            },
+            "prio": 2,
+            "pgn": 129284,
+            "dst": 255,
+            "fields": {
+              "Distance to Waypoint": 12,
+              "Course/Bearing reference": "True",
+              "Perpendicular Crossed": "Yes",
+              "Arrival Circle Entered": "No",
+              "Calculation Type": "Rhumbline",
+              "Bearing, Origin to Destination Waypoint": 3.1,
+              "Bearing, Position to Destination Waypoint": 1.23,
+              "Destination Waypoint Number": 6,
+              "Destination Latitude": 38.9749677,
+              "Destination Longitude": -76.4818398,
+              "Waypoint Closing Velocity": 4
+            }
+          }]
+        }, {
+          // great circle, arrival circle entered, perpendicular cleared
+          input: [ mockNavArrivalApp ],
+          expected: [{
+            "__preprocess__": (testResult) => {
+              delete testResult.fields["SID"]
+              delete testResult.fields["ETA Date"]
+              delete testResult.fields["ETA Time"]
+            },
+            "prio": 2,
+            "pgn": 129284,
+            "dst": 255,
+            "fields": {
+              "Distance to Waypoint": 80,
+              "Course/Bearing reference": "True",
+              "Perpendicular Crossed": "No",
+              "Arrival Circle Entered": "Yes",
+              "Calculation Type": "Great Circle",
+              "Bearing, Origin to Destination Waypoint": 3.1,
+              "Bearing, Position to Destination Waypoint": 1.23,
+              "Destination Waypoint Number": 1,
+              "Destination Latitude": 38.9749677,
+              "Destination Longitude": -76.4818398,
+              "Waypoint Closing Velocity": 4
+            }
+          }]
+        }, {
+          // single destination, no route
+          input: [ mockNavGotoApp ],
+          expected: [{
+            "__preprocess__": (testResult) => {
+              delete testResult.fields["SID"]
+            },
+            "prio": 2,
+            "pgn": 129284,
+            "dst": 255,
+            "fields": {
+              "Distance to Waypoint": 500,
+              "Course/Bearing reference": "True",
+              "Perpendicular Crossed": "No",
+              "Arrival Circle Entered": "No",
+              "Calculation Type": "Great Circle",
+              "Bearing, Origin to Destination Waypoint": 1.25,
+              "Bearing, Position to Destination Waypoint": 1.23,
+              "Destination Waypoint Number": 1,
+              "Destination Latitude": 32.0631296,
+              "Destination Longitude": -75.487264,
+              "Waypoint Closing Velocity": 0
+            }
+          }]
+        }, {
+          // no active course: nothing goes out
+          input: [ mockNavNoCourseApp ],
+          expected: []
+        }, {
+          // the distance has gone null (stale): nothing goes out
+          input: [ mockNavNoDistanceApp ],
+          expected: []
+        }]
+      }, {
+        // Also sent as soon as the course changes, so that a device told to
+        // follow it has the new destination without waiting for the timer.
+        keys: [
+          'navigation.course.activeRoute',
+          'navigation.course.nextPoint',
+          'navigation.course.previousPoint'
+        ],
+        callback: (activeRoute, nextPoint, previousPoint) => {
+          const course = [activeRoute, nextPoint, previousPoint]
+          if (_.isEqual(course, lastCourse))
+            return null
+          lastCourse = course
+          if (!nextPoint)
+            return null
+          return sendNavigationData(app, true)
         },
-        "prio": 2,
-        "pgn": 129284,
-        "dst": 255,
-        "fields": {
-          "SID": 136,
-          "Distance to Waypoint": 12,
-          "Course/Bearing reference": "True",
-          "Perpendicular Crossed": "Yes",
-          "Arrival Circle Entered": "No",
-          "Calculation Type": "Rhumbline",
-          "Bearing, Origin to Destination Waypoint": 3.1,
-          "Bearing, Position to Destination Waypoint": 1.23,
-          "Destination Waypoint Number": 6,
-          "Destination Latitude": 32.0631296,
-          "Destination Longitude": -75.487264,
-          "Waypoint Closing Velocity": 4
-        }
+        tests: [{
+          // no course
+          input: [null, null, null],
+          expected: []
+        }]
       }]
-    }, {
-      input: [ 80, 1.23, 3.1, {position: { longitude: -75.487264, latitude: 32.0631296 }} , 4.0, "GreatCircle", {state: "alert", method: ["visual"], message: "Entered arrival zone"}, {state: "normal", method: [], message: ""}, {pointIndex: 0} ],
-      expected: [{
-        "__preprocess__": (testResult) => {
-          delete testResult.fields["ETA Date"]
-          delete testResult.fields["ETA Time"]
-        },
-        "prio": 2,
-        "pgn": 129284,
-        "dst": 255,
-        "fields": {
-          "SID": 136,
-          "Distance to Waypoint": 80,
-          "Course/Bearing reference": "True",
-          "Perpendicular Crossed": "No",
-          "Arrival Circle Entered": "Yes",
-          "Calculation Type": "Great Circle",
-          "Bearing, Origin to Destination Waypoint": 3.1,
-          "Bearing, Position to Destination Waypoint": 1.23,
-          "Destination Waypoint Number": 1,
-          "Destination Latitude": 32.0631296,
-          "Destination Longitude": -75.487264,
-          "Waypoint Closing Velocity": 4
-        }
-      }]
-    }, {
-      // single destination, no route
-      input: [ 500, 1.23, 1.25, {position: { longitude: -75.487264, latitude: 32.0631296 }} , 0, "GreatCircle", null, null, null ],
-      expected: [{
-        "prio": 2,
-        "pgn": 129284,
-        "dst": 255,
-        "fields": {
-          "SID": 136,
-          "Distance to Waypoint": 500,
-          "Course/Bearing reference": "True",
-          "Perpendicular Crossed": "No",
-          "Arrival Circle Entered": "No",
-          "Calculation Type": "Great Circle",
-          "Bearing, Origin to Destination Waypoint": 1.25,
-          "Bearing, Position to Destination Waypoint": 1.23,
-          "Destination Waypoint Number": 1,
-          "Destination Latitude": 32.0631296,
-          "Destination Longitude": -75.487264,
-          "Waypoint Closing Velocity": 0
-        }
-      }]
-    }]
+    }
   },
   {
     title: 'Route/WP Information (129285)',
@@ -537,3 +637,142 @@ var mockRouteChangedApp = (() => {
     }
   }
 })()
+
+// 129284 mocks: the destination comes from the Course API, the calculated
+// values and notifications from the Signal K tree, as the worker reads them.
+// The leaves are nested so that a subtree can be read in one getSelfPath call.
+function mockNavSelf(values) {
+  const tree = {}
+  Object.entries(values).forEach(([key, value]) => {
+    _.set(tree, key, { value })
+  })
+  return {
+    getSelfPath: (key) => _.get(tree, key)
+  }
+}
+
+var mockNavApp = {
+  courseApi: {
+    getCourse: async () => ({
+      nextPoint: {
+        "type": "RoutePoint",
+        "position": {
+          "latitude": 38.97496773616132,
+          "longitude": -76.48183979803126
+        }
+      },
+      activeRoute: {
+        "href": "mock",
+        "name": "Test Route",
+        "reverse": false,
+        "pointIndex": 5,
+        "pointTotal": 6
+      }
+    })
+  },
+  ...mockNavSelf({
+    'navigation.course.calcValues.distance': 12,
+    'navigation.course.calcValues.bearingTrue': 1.23,
+    'navigation.course.calcValues.bearingTrackTrue': 3.1,
+    'navigation.course.calcValues.velocityMadeGood': 4.0,
+    'navigation.course.calcValues.calcMethod': 'Rhumbline',
+    'notifications.navigation.course.arrivalCircleEntered': null,
+    'notifications.navigation.course.perpendicularPassed': { state: 'alert', method: ['visual'], message: 'Perpendicular passed' }
+  })
+}
+
+var mockNavArrivalApp = {
+  courseApi: {
+    getCourse: async () => ({
+      nextPoint: {
+        "type": "RoutePoint",
+        "position": {
+          "latitude": 38.97496773616132,
+          "longitude": -76.48183979803126
+        }
+      },
+      activeRoute: {
+        "href": "mock",
+        "name": "Test Route",
+        "reverse": false,
+        "pointIndex": 0,
+        "pointTotal": 6
+      }
+    })
+  },
+  ...mockNavSelf({
+    'navigation.course.calcValues.distance': 80,
+    'navigation.course.calcValues.bearingTrue': 1.23,
+    'navigation.course.calcValues.bearingTrackTrue': 3.1,
+    'navigation.course.calcValues.velocityMadeGood': 4.0,
+    'navigation.course.calcValues.calcMethod': 'GreatCircle',
+    'notifications.navigation.course.arrivalCircleEntered': { state: 'alert', method: ['visual'], message: 'Entered arrival zone' },
+    'notifications.navigation.course.perpendicularPassed': { state: 'normal', method: [], message: '' }
+  })
+}
+
+var mockNavGotoApp = {
+  courseApi: {
+    getCourse: async () => ({
+      activeRoute: null,
+      previousPoint: {
+        "type": "VesselPosition",
+        "position": {
+          "latitude": 38.97496773616132,
+          "longitude": -76.48183979803126
+        }
+      },
+      nextPoint: {
+        "type": "Location",
+        "name": "DP",
+        "position": {
+          "latitude": 32.0631296,
+          "longitude": -75.487264
+        }
+      }
+    })
+  },
+  ...mockNavSelf({
+    'navigation.course.calcValues.distance': 500,
+    'navigation.course.calcValues.bearingTrue': 1.23,
+    'navigation.course.calcValues.bearingTrackTrue': 1.25,
+    'navigation.course.calcValues.velocityMadeGood': 0,
+    'navigation.course.calcValues.calcMethod': 'GreatCircle',
+    'notifications.navigation.course.arrivalCircleEntered': null,
+    'notifications.navigation.course.perpendicularPassed': null
+  })
+}
+
+var mockNavNoCourseApp = {
+  courseApi: {
+    // The Course API returns an object even without an active course
+    getCourse: async () => ({ activeRoute: null })
+  },
+  ...mockNavSelf({})
+}
+
+// The server nulls a value that has gone stale, so the distance can be null
+// with the rest of the course still present.
+var mockNavNoDistanceApp = {
+  courseApi: {
+    getCourse: async () => ({
+      nextPoint: {
+        "type": "RoutePoint",
+        "position": {
+          "latitude": 38.97496773616132,
+          "longitude": -76.48183979803126
+        }
+      },
+      activeRoute: {
+        "href": "mock",
+        "name": "Test Route",
+        "reverse": false,
+        "pointIndex": 0,
+        "pointTotal": 6
+      }
+    })
+  },
+  ...mockNavSelf({
+    'navigation.course.calcValues.distance': null
+  })
+}
